@@ -60,7 +60,9 @@ class App:
         q=self.quotes.get(symbol); return q if q and time.time()-q["ts"]<=15 else None
     def market_loop(self):
         while not self.stop.is_set():
-            with self.lock: network=self.state["settings"]["network"]; generation=self.market_generation
+            with self.lock:
+                network=self.state["settings"]["network"]; generation=self.market_generation
+                basis_symbols={b["symbol"] for b in self.state["bots"] if b["strategy"]=="Basis"}
             try:
                 rows=bybit(network,"market/tickers",category="linear")["list"]
                 q={}
@@ -69,11 +71,19 @@ class App:
                         try: q[row["symbol"]]=quote(row)
                         except (ValueError,KeyError): pass
                 if not q: raise RuntimeError("Нет корректных котировок")
+                for sym in basis_symbols.intersection(q):
+                    try:
+                        spot=bybit(network,"market/tickers",category="spot",symbol=sym)["list"][0]
+                        bid=paper.number(spot["bid1Price"],1e-12); ask=paper.number(spot["ask1Price"],bid)
+                        q[sym].update(spot_bid=bid,spot_ask=ask,spot_ts=time.time())
+                    except Exception: pass
                 with self.lock:
                     if generation==self.market_generation:
                         self.quotes=q; self.error=""; before=copy.deepcopy(self.state)
-                        paper.tick(self.state,q)
-                        if before!=self.state: self.save()
+                        try:
+                            paper.tick(self.state,{k:v for k,v in q.items() if time.time()-v["ts"]<=15})
+                            if before!=self.state: self.save()
+                        except Exception: self.state=before; raise
             except Exception as e:
                 with self.lock:
                     if generation==self.market_generation: self.error=str(e)[:300]
@@ -96,7 +106,9 @@ class App:
             for p in s["positions"]:
                 q=self.fresh(p["symbol"]); p["pnl"]=paper.pnl(p,q["bid" if p["side"]=="long" else "ask"]) if q else None
                 p["liquidation"]=paper.liquidation(p)
-            return dict(state=s,available=paper.available(s),quotes={k:self.fresh(k) for k in paper.PAIRS},market_error=self.error,core=self.core.status(),news=self.news,news_error=self.news_error,news_at=self.news_at,rates=self.rates)
+            articles={x["id"]:x for x in self.news}
+            for id,item in s.get("saved_articles",{}).items(): articles.setdefault(id,item)
+            return dict(state=s,available=paper.available(s),quotes={k:self.fresh(k) for k in paper.PAIRS},market_error=self.error,core=self.core.status(),news=list(articles.values()),news_error=self.news_error,news_at=self.news_at,rates=self.rates)
     def details(self,symbol):
         if symbol not in paper.PAIRS: raise ValueError("Неизвестная пара")
         with self.lock: network=self.state["settings"]["network"]; interval=self.state["settings"]["timeframe"]
@@ -133,8 +145,12 @@ class App:
                     b=next(b for b in s["bots"] if b["id"]==d["id"]); paper.bot_action(s,b["id"],d["operation"],self.fresh(b["symbol"]))
                 elif a=="save_news":
                     id=str(d["id"])[:2048]
-                    if id in s["saved"]: s["saved"].remove(id)
-                    elif len(s["saved"])<1000: s["saved"].append(id)
+                    articles=s.setdefault("saved_articles",{})
+                    if id in s["saved"]: s["saved"].remove(id); articles.pop(id,None)
+                    elif len(s["saved"])<1000:
+                        item=next((x for x in self.news if x["id"]==id),None)
+                        if not item: raise ValueError("Материал не найден")
+                        s["saved"].append(id); articles[id]=item
                 elif a=="settings":
                     k=d["key"]; v=d["value"]
                     allowed={"theme":("dark","light"),"currency":("USDT","USD","EUR","RUB"),"timeframe":("1","5","15","60","240","D"),"compact":(True,False),"network":("main","testnet")}
@@ -144,7 +160,7 @@ class App:
                         self.quotes={}; self.market_generation+=1; self.error="Ожидание новой сети"
                     s["settings"][k]=v
                 elif a=="reset":
-                    self.state=paper.initial(); self.state["settings"]=s["settings"]; self.state["saved"]=s["saved"]
+                    self.state=paper.initial(); self.state["settings"]=s["settings"]; self.state["saved"]=s["saved"]; self.state["saved_articles"]=s.get("saved_articles",{})
                 elif a=="network_reset":
                     if s["positions"] or s["pending"] or s["bots"]: raise ValueError("Сначала закройте позиции, ордера и ботов")
                     s["settings"]["network"]="main"; self.quotes={}; self.market_generation+=1
@@ -184,12 +200,27 @@ def handler(app):
                 self.send(app.action(json.loads(self.rfile.read(size))))
             except Exception as e: self.send({"error":str(e)[:1000] or type(e).__name__},400)
     return Handler
+def acquire_instance(home):
+    home.mkdir(parents=True,exist_ok=True); f=(home/"app.lock").open("a+b"); f.seek(0,2)
+    if not f.tell(): f.write(b"0"); f.flush()
+    f.seek(0)
+    try:
+        if os.name=="nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except OSError:
+        f.close(); raise SystemExit("enaverse уже запущен; закройте предыдущий процесс.")
+    return f
 def main():
+    instance=acquire_instance(HOME)
     app=App(HOME); server=ThreadingHTTPServer(("127.0.0.1",0),handler(app)); server.daemon_threads=True
     for task in (app.market_loop,app.news_loop): threading.Thread(target=task,daemon=True).start()
     url="http://127.0.0.1:"+str(server.server_port); print("enaverse · "+url,flush=True)
     if "--no-browser" not in sys.argv: webbrowser.open(url)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
-    finally: app.stop.set(); app.core.stop(); server.server_close()
+    finally: app.stop.set(); app.core.stop(); server.server_close(); instance.close()
 if __name__=="__main__": main()

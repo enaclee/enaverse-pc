@@ -5,6 +5,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 import paper
 from core_host import Core
+from ai_provider import AI
 
 ROOT=Path(__file__).resolve().parent
 HOME=Path(os.environ.get("ENAVERSE_HOME") or Path(os.environ.get("LOCALAPPDATA") or Path.home()/".local/share")/"enaverse")
@@ -51,7 +52,7 @@ class App:
         self.home=Path(home); self.home.mkdir(parents=True,exist_ok=True)
         self.path=self.home/"paper.json"; self.lock=threading.RLock()
         self.state=json.loads(self.path.read_text("utf-8")) if self.path.exists() else paper.initial()
-        self.core=Core(self.home); self.quotes={}; self.error="Ожидание Bybit"; self.market_generation=0
+        self.core=Core(self.home); self.ai=AI(); self.quotes={}; self.error="Ожидание Bybit"; self.market_generation=0
         self.stop=threading.Event(); self.news=[]; self.news_error="Ожидание RSS"; self.rates={"USDT":1,"USD":1}
         self.news_at=0
     def save(self):
@@ -108,7 +109,11 @@ class App:
                 p["liquidation"]=paper.liquidation(p)
             articles={x["id"]:x for x in self.news}
             for id,item in s.get("saved_articles",{}).items(): articles.setdefault(id,item)
-            return dict(state=s,available=paper.available(s),quotes={k:self.fresh(k) for k in paper.PAIRS},market_error=self.error,core=self.core.status(),news=list(articles.values()),news_error=self.news_error,news_at=self.news_at,rates=self.rates)
+            items=[]
+            for id,item in articles.items():
+                assessment=s.get("news_assessments",{}).get(id)
+                items.append({**item,"impact":assessment or item.get("impact","Не оценено")})
+            return dict(state=s,available=paper.available(s),quotes={k:self.fresh(k) for k in paper.PAIRS},market_error=self.error,core=self.core.status(),ai=self.ai.status(),news=items,news_error=self.news_error,news_at=self.news_at,rates=self.rates)
     def details(self,symbol):
         if symbol not in paper.PAIRS: raise ValueError("Неизвестная пара")
         with self.lock: network=self.state["settings"]["network"]; interval=self.state["settings"]["timeframe"]
@@ -126,6 +131,30 @@ class App:
         return result
     def action(self,d):
         a=d["action"]
+        if a=="ai_config":return self.ai.configure(d["mode"],d.get("model",""),d.get("key",""))
+        if a=="ai_analyze":
+            symbol=d["symbol"]
+            if symbol not in paper.PAIRS:raise ValueError("Неизвестная пара")
+            with self.lock:
+                q=copy.deepcopy(self.fresh(symbol))
+                nid=d.get("news_id")
+                item=next((x for x in self.news if x["id"]==nid),None) or self.state.get("saved_articles",{}).get(nid)
+                if nid and not item:raise ValueError("Материал больше недоступен")
+            # Do not send portfolio, secrets or arbitrary files. Only explicitly requested market/news context.
+            q={k:v for k,v in (q or {}).items() if k in ("last","ask","bid","high","low","volume","oi","change","funding","ts")}
+            detail=d.get("details") or {}; forecast=d.get("forecast") or {}
+            detail={k:detail[k] for k in ("trend","volatility","levels") if k in detail}
+            forecast={k:forecast[k] for k in ("ok","error","trade_ready","cached_age_ms","decision_gate","confirm_long","confirm_short","best") if k in forecast}
+            news={k:item[k] for k in ("title","description","source","time") if k in item} if item else None
+            result=self.ai.analyze(d["prompt"],d.get("history",[]),{"symbol":symbol,"quote":q,"details":detail,"enacore":forecast,"news":news})
+            if item:
+                impact={"positive":"Позитивное","negative":"Негативное","mixed":"Смешанное","uncertain":"Неопределённое"}[result["response"]["impact"]]
+                with self.lock:
+                    assessments=self.state.setdefault("news_assessments",{})
+                    assessments[nid]="AI: "+impact+" · "+result["model"]
+                    while len(assessments)>1000:assessments.pop(next(iter(assessments)))
+                    self.save()
+            return result
         if a=="core_rpc":
             return self.core.rpc(d["method"],d.get("args"))
         if a=="core_install":
@@ -160,7 +189,7 @@ class App:
                         self.quotes={}; self.market_generation+=1; self.error="Ожидание новой сети"
                     s["settings"][k]=v
                 elif a=="reset":
-                    self.state=paper.initial(); self.state["settings"]=s["settings"]; self.state["saved"]=s["saved"]; self.state["saved_articles"]=s.get("saved_articles",{})
+                    self.state=paper.initial(); self.state["settings"]=s["settings"]; self.state["saved"]=s["saved"]; self.state["saved_articles"]=s.get("saved_articles",{}); self.state["news_assessments"]=s.get("news_assessments",{})
                 elif a=="network_reset":
                     if s["positions"] or s["pending"] or s["bots"]: raise ValueError("Сначала закройте позиции, ордера и ботов")
                     s["settings"]["network"]="main"; self.quotes={}; self.market_generation+=1

@@ -45,6 +45,19 @@ class PaperTest(unittest.TestCase):
             blob=f.getvalue()
             with self.assertRaises(ValueError):c.install(blob,hashlib.sha256(blob).hexdigest())
             self.assertFalse((Path(tmp)/"evil.py").exists())
+class AIModelTest(unittest.TestCase):
+    def test_explicit_configuration_and_structured_response(self):
+        from unittest.mock import patch
+        from ai_provider import AI
+        a=AI()
+        with self.assertRaises(ValueError):a.analyze("Тест",[],{})
+        a.configure("openai","test-model","test-secret")
+        self.assertNotIn("test-secret",json.dumps(a.status()))
+        answer=dict(bias="neutral",summary="insufficient data",levels=[],checklist=["check"],risk="paper",impact="uncertain")
+        with patch("ai_provider.request",return_value={"choices":[{"message":{"content":json.dumps(answer)}}]}) as m:
+            r=a.analyze("Тест",[],{});self.assertEqual(r["response"]["bias"],"neutral")
+            self.assertEqual(m.call_args.args[2],"test-secret")
+        a.configure("none","","");self.assertFalse(a.status()["ready"])
 class ApiTest(unittest.TestCase):
     def test_http(self):
         with tempfile.TemporaryDirectory() as d:
